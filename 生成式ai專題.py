@@ -123,85 +123,270 @@ def safe_read_csv(path, usecols=None):
 
 @st.cache_data(show_spinner=False)
 def load_data():
-    clean_event_view = safe_read_csv(
-        "output/clean_event_view.csv",
-        usecols=EVENT_COLS
-    )
+    """
+    讀取 Streamlit 需要的資料。
 
-    # 優先讀取強化 SOP 表，若不存在則讀原本 clean_sop_view
-    clean_sop_view = safe_read_csv(
-        "output/sop_detail_view.csv",
-        usecols=SOP_COLS
-    )
+    重要：
+    - Colab 版本會先產生 output/*.csv，所以原本 app 只讀 output。
+    - Streamlit Cloud / GitHub 上如果沒有 output 資料夾，就會變成 0 筆，後面也會 KeyError。
+    - 這版會先讀 output；若 output 不存在或主要資料為空，會自動從「Dataset/資料集.xlsx」重新建立資料表。
+    """
 
+    def _find_file(filename):
+        candidates = [
+            filename,
+            f"./{filename}",
+            f"/mount/src/{filename}",
+            f"/mount/src/genai_final/{filename}",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        for root, _, files in os.walk("."):
+            if filename in files:
+                return os.path.join(root, filename)
+        return None
+
+    def _ensure_columns(df, cols):
+        for col in cols:
+            if col not in df.columns:
+                df[col] = pd.NA
+        return df
+
+    def _classify_stage(title, content):
+        text = f"{title} {content}"
+        if any(k in text for k in ["根節點", "確認是否", "判斷是否", "確認異常", "持續", "觀察", "是否仍"]):
+            return "1. 異常確認"
+        if any(k in text for k in ["安全", "停機", "隔離", "防護", "通知", "危險"]):
+            return "2. 安全處置"
+        if any(k in text for k in ["檢查", "確認", "比對", "量測", "查看", "判斷", "監控"]):
+            return "3. 原因排查"
+        if any(k in text for k in ["調整", "更換", "清除", "修正", "處理", "復歸", "退爐", "降速"]):
+            return "4. 處置修正"
+        if any(k in text for k in ["復機", "試軋", "恢復", "結案", "再確認", "OK"]):
+            return "5. 復機確認"
+        if any(k in text for k in ["紀錄", "回報", "上傳", "改善", "修訂", "回填"]):
+            return "6. 紀錄回饋"
+        return "3. 原因排查"
+
+    def _translate_check_type(value):
+        value = str(value).lower().strip()
+        if value == "auto":
+            return "系統自動判斷"
+        if value == "manual":
+            return "人工確認"
+        if value == "hybrid":
+            return "系統輔助 + 人工確認"
+        return "未標示，需人工確認"
+
+    def _evidence(row):
+        evidence = []
+        if pd.notna(row.get("monitor_name")) and str(row.get("monitor_name")).strip() not in ["", "nan", "None"]:
+            evidence.append("系統參數截圖 / 感測數值")
+        if str(row.get("image_needed", "")).lower() in ["true", "1", "yes", "y", "需要"]:
+            evidence.append("現場照片")
+        if pd.notna(row.get("safety_note")) and str(row.get("safety_note")).strip() not in ["", "nan", "None"]:
+            evidence.append("安全確認紀錄")
+        if not evidence:
+            evidence.append("人工確認備註")
+        return "、".join(evidence)
+
+    def _next_hint(row):
+        text = f"{row.get('step_title', '')} {row.get('step_content', '')}"
+        if any(k in text for k in ["加熱", "溫度", "在爐", "鋼種"]):
+            return "若加熱條件異常，請比對鋼種標準，必要時調整加熱參數或通知製程工程師。"
+        if any(k in text for k in ["軸承", "傳動", "馬達", "電流", "Guide", "Roll", "軋輥"]):
+            return "若設備機構或電流異常，請通知設備工程師檢查磨耗、鬆動、卡滯或破損。"
+        if any(k in text for k in ["訊號", "PLC", "sensor", "感測", "通訊", "loss"]):
+            return "若訊號異常，請確認 PLC、通訊狀態、感測器連線與資料是否缺漏。"
+        if any(k in text for k in ["水量", "噴嘴", "冷卻", "流量", "壓力"]):
+            return "若水量、噴嘴或壓力異常，請確認水量設定、阻塞狀態、角度與壓力來源。"
+        return "若此步驟判定異常，請依 SOP 進入下一步，並留下處置紀錄。"
+
+    # ---------------------------------------------------------
+    # 1) 先讀 output CSV。這是 Colab 版本原本的路徑。
+    # ---------------------------------------------------------
+    clean_event_view = safe_read_csv("output/clean_event_view.csv", usecols=EVENT_COLS)
+
+    clean_sop_view = safe_read_csv("output/sop_detail_view.csv", usecols=SOP_COLS)
     if clean_sop_view.empty:
-        clean_sop_view = safe_read_csv(
-            "output/clean_sop_view.csv",
-            usecols=SOP_COLS
-        )
+        clean_sop_view = safe_read_csv("output/clean_sop_view.csv", usecols=SOP_COLS)
 
-    clean_sensor_view = safe_read_csv(
-        "output/clean_sensor_view.csv",
-        usecols=SENSOR_COLS
-    )
+    clean_sensor_view = safe_read_csv("output/clean_sensor_view.csv", usecols=SENSOR_COLS)
+    human_assist_view = safe_read_csv("output/human_assist_view.csv", usecols=HUMAN_ASSIST_COLS)
 
-    human_assist_view = safe_read_csv(
-        "output/human_assist_view.csv",
-        usecols=HUMAN_ASSIST_COLS
-    )
+    graph_nodes = safe_read_csv("output/graph_nodes.csv") if os.path.exists("output/graph_nodes.csv") else None
+    graph_edges = safe_read_csv("output/graph_edges.csv") if os.path.exists("output/graph_edges.csv") else None
 
-    graph_nodes = None
-    graph_edges = None
+    # ---------------------------------------------------------
+    # 2) 若 output 不存在或主要資料為空，自動改從 Excel 建立。
+    # ---------------------------------------------------------
+    if clean_event_view.empty or "equipment_code" not in clean_event_view.columns:
+        excel_path = _find_file("Dataset/資料集.xlsx")
+        if excel_path is None:
+            st.error("找不到 Dataset/資料集.xlsx。請確認 GitHub 的 Dataset 資料夾內有資料集.xlsx，或上傳 output 資料夾。")
+            st.stop()
 
-    if os.path.exists("output/graph_nodes.csv"):
-        graph_nodes = safe_read_csv("output/graph_nodes.csv")
+        try:
+            xls = pd.ExcelFile(excel_path)
+            tables = {sheet: pd.read_excel(excel_path, sheet_name=sheet) for sheet in xls.sheet_names}
+        except Exception as exc:
+            st.error(f"讀取 Dataset/資料集.xlsx 失敗：{exc}")
+            st.stop()
 
-    if os.path.exists("output/graph_edges.csv"):
-        graph_edges = safe_read_csv("output/graph_edges.csv")
+        required = ["05_cate_detail", "06_equipment", "07_state", "09_monitor_function", "11_sop_main", "12_sop_step", "13_abnormal_event", "14_event_step_check", "15_sensor_snapshot"]
+        missing = [s for s in required if s not in tables]
+        if missing:
+            st.error(f"Dataset/資料集.xlsx 缺少必要工作表：{missing}")
+            st.stop()
+
+        cate_detail = tables["05_cate_detail"].copy()
+        equipment = tables["06_equipment"].copy()
+        state = tables["07_state"].copy()
+        monitor_function = tables["09_monitor_function"].copy()
+        sop_main = tables["11_sop_main"].copy()
+        sop_step = tables["12_sop_step"].copy()
+        abnormal_event = tables["13_abnormal_event"].copy()
+        sensor_snapshot = tables["15_sensor_snapshot"].copy()
+
+        # clean_event_view
+        clean_event_view = abnormal_event.copy()
+        if "equipment_id" in clean_event_view.columns and "equipment_id" in equipment.columns:
+            eq_cols = [c for c in ["equipment_id", "equipment_code", "equipment_name"] if c in equipment.columns]
+            clean_event_view = clean_event_view.merge(equipment[eq_cols].drop_duplicates(), on="equipment_id", how="left")
+        if "state_id" in clean_event_view.columns and "state_id" in state.columns:
+            st_cols = [c for c in ["state_id", "state_name", "default_severity"] if c in state.columns]
+            clean_event_view = clean_event_view.merge(state[st_cols].drop_duplicates(), on="state_id", how="left")
+        if "cate_detail_id" in clean_event_view.columns and "cate_detail_id" in cate_detail.columns and "name" in cate_detail.columns:
+            clean_event_view = clean_event_view.merge(
+                cate_detail[["cate_detail_id", "name"]].rename(columns={"name": "cate_detail_name"}).drop_duplicates(),
+                on="cate_detail_id", how="left"
+            )
+        if "sop_id" in clean_event_view.columns and "sop_id" in sop_main.columns:
+            sop_cols = [c for c in ["sop_id", "sop_name", "sop_desc", "owner_role"] if c in sop_main.columns]
+            clean_event_view = clean_event_view.merge(sop_main[sop_cols].drop_duplicates(), on="sop_id", how="left")
+        clean_event_view = _ensure_columns(clean_event_view, EVENT_COLS + ["close_result", "equipment_id", "state_id", "root_cause_category"])
+
+        # clean_sop_view
+        clean_sop_view = sop_step.copy()
+        if "sop_id" in clean_sop_view.columns and "sop_id" in sop_main.columns:
+            sop_cols = [c for c in ["sop_id", "equipment_id", "state_id", "sop_name", "sop_desc", "version", "status", "owner_role"] if c in sop_main.columns]
+            clean_sop_view = clean_sop_view.merge(sop_main[sop_cols].drop_duplicates(), on="sop_id", how="left")
+        if "equipment_id" in clean_sop_view.columns and "equipment_id" in equipment.columns:
+            eq_cols = [c for c in ["equipment_id", "equipment_code", "equipment_name", "line_area"] if c in equipment.columns]
+            clean_sop_view = clean_sop_view.merge(equipment[eq_cols].drop_duplicates(), on="equipment_id", how="left")
+        if "state_id" in clean_sop_view.columns and "state_id" in state.columns:
+            st_cols = [c for c in ["state_id", "state_name", "default_severity"] if c in state.columns]
+            clean_sop_view = clean_sop_view.merge(state[st_cols].drop_duplicates(), on="state_id", how="left")
+        if "monitor_id" in clean_sop_view.columns and "monitor_id" in monitor_function.columns:
+            mon_cols = [c for c in ["monitor_id", "monitor_name", "subgroup", "data_source_system", "description"] if c in monitor_function.columns]
+            clean_sop_view = clean_sop_view.merge(monitor_function[mon_cols].drop_duplicates(), on="monitor_id", how="left")
+        clean_sop_view = _ensure_columns(clean_sop_view, SOP_COLS)
+        clean_sop_view["sop_stage"] = clean_sop_view.apply(lambda r: _classify_stage(r.get("step_title", ""), r.get("step_content", "")), axis=1)
+        clean_sop_view["check_method_label"] = clean_sop_view["check_type"].apply(_translate_check_type)
+        clean_sop_view["evidence_required"] = clean_sop_view.apply(_evidence, axis=1)
+        clean_sop_view["next_action_hint"] = clean_sop_view.apply(_next_hint, axis=1)
+
+        # clean_sensor_view
+        clean_sensor_view = sensor_snapshot.copy()
+        if "monitor_id" in clean_sensor_view.columns and "monitor_id" in monitor_function.columns:
+            mon_cols = [c for c in ["monitor_id", "monitor_name", "subgroup", "data_source_system", "description"] if c in monitor_function.columns]
+            clean_sensor_view = clean_sensor_view.merge(monitor_function[mon_cols].drop_duplicates(), on="monitor_id", how="left")
+        if "event_id" in clean_sensor_view.columns and "event_id" in clean_event_view.columns:
+            event_cols = [c for c in ["event_id", "occurred_at", "equipment_code", "equipment_name", "state_name", "severity", "root_cause_category"] if c in clean_event_view.columns]
+            clean_sensor_view = clean_sensor_view.merge(clean_event_view[event_cols].drop_duplicates(), on="event_id", how="left")
+        clean_sensor_view = _ensure_columns(clean_sensor_view, SENSOR_COLS)
+
+        # human_assist_view：若沒有原本 output，就從 SOP 步驟建立簡化版人工輔助資料。
+        records = []
+        for _, row in clean_sop_view.iterrows():
+            title = str(row.get("step_title", "")).strip()
+            if title in ["", "根節點", "nan", "None"]:
+                continue
+            check_type = str(row.get("check_type", "")).lower()
+            manual_related = (
+                check_type in ["manual", "hybrid"]
+                or pd.isna(row.get("monitor_name"))
+                or str(row.get("image_needed", "")).lower() in ["true", "1", "yes", "y", "需要"]
+                or pd.notna(row.get("safety_note"))
+            )
+            if not manual_related:
+                continue
+            records.append({
+                "source_table": "12_sop_step",
+                "equipment_code": row.get("equipment_code"),
+                "state_keyword": row.get("state_name"),
+                "assist_type": row.get("sop_stage", "SOP人工確認"),
+                "check_item": row.get("step_title"),
+                "human_action": row.get("step_content"),
+                "related_monitor_id": row.get("monitor_id"),
+                "evidence_required": row.get("evidence_required"),
+                "escalation_rule": row.get("next_action_hint"),
+                "source_note": f"來自 {row.get('sop_id', '')}｜{row.get('sop_name', '')}"
+            })
+        human_assist_view = pd.DataFrame(records)
+        human_assist_view = _ensure_columns(human_assist_view, HUMAN_ASSIST_COLS)
+
+        # graph_nodes / graph_edges：建立穩定可展示的簡化圖譜資料。
+        node_records = []
+        edge_records = []
+        def add_node(node_id, node_type, label):
+            node_records.append({"node_id": node_id, "node_type": node_type, "label": label})
+        def add_edge(src, tgt, rel, name):
+            edge_records.append({"source": src, "target": tgt, "relation": rel, "relation_name": name})
+        for _, row in clean_event_view.iterrows():
+            eq = row.get("equipment_code")
+            stn = row.get("state_name")
+            sopid = row.get("sop_id")
+            eventid = row.get("event_id")
+            cause = row.get("root_cause_category")
+            if pd.notna(eq): add_node(f"Equipment:{eq}", "Equipment", str(eq))
+            if pd.notna(stn): add_node(f"State:{stn}", "State", str(stn))
+            if pd.notna(eventid): add_node(f"Event:{eventid}", "Event", str(eventid))
+            if pd.notna(sopid): add_node(f"SOP:{sopid}", "SOP", str(row.get("sop_name", sopid)))
+            if pd.notna(cause): add_node(f"Cause:{cause}", "Cause", str(cause))
+            if pd.notna(eq) and pd.notna(stn): add_edge(f"Equipment:{eq}", f"State:{stn}", "HAS_STATE", "設備可能發生此異常")
+            if pd.notna(eventid) and pd.notna(eq): add_edge(f"Event:{eventid}", f"Equipment:{eq}", "OCCURRED_ON", "事件發生於此設備")
+            if pd.notna(eventid) and pd.notna(stn): add_edge(f"Event:{eventid}", f"State:{stn}", "HAS_ABNORMAL_STATE", "事件屬於此異常狀況")
+            if pd.notna(eventid) and pd.notna(sopid): add_edge(f"Event:{eventid}", f"SOP:{sopid}", "USED_SOP", "事件使用此 SOP")
+            if pd.notna(eventid) and pd.notna(cause): add_edge(f"Event:{eventid}", f"Cause:{cause}", "HAS_CAUSE", "事件原因分類")
+        for _, row in clean_sop_view.iterrows():
+            sopid = row.get("sop_id")
+            stepid = row.get("step_id")
+            if pd.notna(sopid) and pd.notna(stepid):
+                add_node(f"SOPStep:{stepid}", "SOPStep", str(row.get("step_title", stepid)))
+                add_edge(f"SOP:{sopid}", f"SOPStep:{stepid}", "HAS_STEP", "SOP 包含此步驟")
+        graph_nodes = pd.DataFrame(node_records).drop_duplicates() if node_records else pd.DataFrame(columns=["node_id", "node_type", "label"])
+        graph_edges = pd.DataFrame(edge_records).drop_duplicates() if edge_records else pd.DataFrame(columns=["source", "target", "relation", "relation_name"])
+
+    # ---------------------------------------------------------
+    # 3) 共同清理型別與保底欄位，避免 KeyError。
+    # ---------------------------------------------------------
+    clean_event_view = _ensure_columns(clean_event_view, EVENT_COLS + ["close_result", "root_cause_category"])
+    clean_sop_view = _ensure_columns(clean_sop_view, SOP_COLS)
+    clean_sensor_view = _ensure_columns(clean_sensor_view, SENSOR_COLS)
+    human_assist_view = _ensure_columns(human_assist_view, HUMAN_ASSIST_COLS)
 
     for col in ["equipment_code", "state_name", "severity", "root_cause_category"]:
-        if col in clean_event_view.columns:
-            clean_event_view[col] = clean_event_view[col].astype(str)
+        clean_event_view[col] = clean_event_view[col].astype(str).replace("nan", pd.NA)
 
     for col in ["equipment_code", "state_name", "sop_id", "step_id", "parent_step_id"]:
-        if col in clean_sop_view.columns:
-            clean_sop_view[col] = clean_sop_view[col].astype(str).replace("nan", pd.NA)
+        clean_sop_view[col] = clean_sop_view[col].astype(str).replace("nan", pd.NA)
 
     for col in ["equipment_code", "state_keyword", "check_item", "human_action"]:
-        if col in human_assist_view.columns:
-            human_assist_view[col] = human_assist_view[col].astype(str).replace("nan", pd.NA)
+        human_assist_view[col] = human_assist_view[col].astype(str).replace("nan", pd.NA)
 
-    if "downtime_min" in clean_event_view.columns:
-        clean_event_view["downtime_min"] = pd.to_numeric(
-            clean_event_view["downtime_min"],
-            errors="coerce"
-        )
-
-    if "occurred_at" in clean_event_view.columns:
-        clean_event_view["occurred_at"] = pd.to_datetime(
-            clean_event_view["occurred_at"],
-            errors="coerce"
-        )
-
-    if "captured_at" in clean_sensor_view.columns:
-        clean_sensor_view["captured_at"] = pd.to_datetime(
-            clean_sensor_view["captured_at"],
-            errors="coerce"
-        )
+    clean_event_view["downtime_min"] = pd.to_numeric(clean_event_view["downtime_min"], errors="coerce")
+    clean_event_view["occurred_at"] = pd.to_datetime(clean_event_view["occurred_at"], errors="coerce")
+    clean_sensor_view["captured_at"] = pd.to_datetime(clean_sensor_view["captured_at"], errors="coerce")
 
     for col in ["actual_value", "spec_lower", "spec_upper"]:
-        if col in clean_sensor_view.columns:
-            clean_sensor_view[col] = pd.to_numeric(clean_sensor_view[col], errors="coerce")
+        clean_sensor_view[col] = pd.to_numeric(clean_sensor_view[col], errors="coerce")
 
     for col in ["monitor_name", "parameter_name", "judgement", "unit"]:
-        if col in clean_sensor_view.columns:
-            clean_sensor_view[col] = clean_sensor_view[col].astype(str).replace("nan", pd.NA)
+        clean_sensor_view[col] = clean_sensor_view[col].astype(str).replace("nan", pd.NA)
 
-    if "sort_order" in clean_sop_view.columns:
-        clean_sop_view["sort_order"] = pd.to_numeric(
-            clean_sop_view["sort_order"],
-            errors="coerce"
-        )
+    clean_sop_view["sort_order"] = pd.to_numeric(clean_sop_view["sort_order"], errors="coerce")
 
     return clean_event_view, clean_sop_view, clean_sensor_view, graph_nodes, graph_edges, human_assist_view
 
